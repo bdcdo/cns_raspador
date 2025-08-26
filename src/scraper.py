@@ -17,19 +17,48 @@ from pathlib import Path
 from typing import Any
 
 
-def gerar_urls_paginas() -> list[str]:
+def gerar_anos() -> list[str]:
     """
-    Gera lista de páginas de resoluções do CNS por ano (2025 a 1988).
+    Gera lista de anos de resoluções do CNS (2025 a 1988).
     
-    Esta função cria URLs para todas as páginas de resoluções do CNS,
-    começando do ano mais recente (2025) até 1988. O site do governo
-    organiza as resoluções por ano em URLs específicas.
+    Esta função cria uma lista de anos para processamento,
+    começando do ano mais recente (2025) até 1988.
     
     Returns:
-        list[str]: Lista de URLs das páginas de resoluções por ano
+        list[str]: Lista de anos como strings
     """
-    return [f'https://www.gov.br/conselho-nacional-de-saude/pt-br/atos-normativos/resolucoes/{ano}' 
-            for ano in range(2025, 1987, -1)]
+    return [str(ano) for ano in range(2025, 1987, -1)]
+
+
+def gerar_url_pagina(ano: str, b_start: int = 0) -> str:
+    """
+    Gera URL para uma página específica de um ano com paginação.
+    
+    Args:
+        ano (str): Ano das resoluções
+        b_start (int): Parâmetro de paginação (múltiplos de 20)
+        
+    Returns:
+        str: URL da página com paginação
+    """
+    base_url = f'https://www.gov.br/conselho-nacional-de-saude/pt-br/acesso-a-informacao/atos-normativos/resolucoes/{ano}'
+    if b_start == 0:
+        return base_url
+    return f'{base_url}?b_start:int={b_start}'
+
+
+def pagina_esta_vazia(soup: BeautifulSoup) -> bool:
+    """
+    Verifica se a página contém o texto indicando que não há itens.
+    
+    Args:
+        soup (BeautifulSoup): Objeto BeautifulSoup da página
+        
+    Returns:
+        bool: True se a página está vazia, False caso contrário
+    """
+    texto_vazio = "Atualmente não existem itens nessa pasta."
+    return texto_vazio in soup.get_text()
 
 
 def extrair_dados_artigo(artigo: Any) -> dict[str, str]:
@@ -116,23 +145,20 @@ def extrair_dados_artigo(artigo: Any) -> dict[str, str]:
         }
 
 
-def coletar_dados_pagina(url: str, ano: str) -> list[dict[str, str]]:
+def coletar_dados_pagina_unica(url: str, ano: str, pagina: int = 1) -> tuple[list[dict[str, str]], bool]:
     """
-    Coleta dados de todos os artigos em uma página específica.
-    
-    Esta função acessa uma página do CNS de um ano específico e extrai
-    todas as resoluções listadas nessa página. Cada resolução é processada
-    pela função extrair_dados_artigo().
+    Coleta dados de uma única página específica.
     
     Args:
         url (str): URL da página a ser processada
         ano (str): Ano de referência para identificação
+        pagina (int): Número da página para log
         
     Returns:
-        list[dict[str, str]]: Lista de dicionários contendo os dados dos artigos/resoluções
+        tuple[list[dict[str, str]], bool]: (dados_artigos, pagina_vazia)
     """
     try:
-        print(f"Coletando dados de {ano}: {url}")
+        print(f"  Coletando dados de {ano} - Página {pagina}: {url}")
         
         # Faz a requisição HTTP para obter o conteúdo da página
         response = requests.get(url)
@@ -141,12 +167,17 @@ def coletar_dados_pagina(url: str, ano: str) -> list[dict[str, str]]:
         # Parse do HTML usando BeautifulSoup
         soup = BeautifulSoup(response.text, 'html.parser')
         
+        # Verifica se a página está vazia
+        if pagina_esta_vazia(soup):
+            print(f"  Página {pagina} vazia encontrada para {ano}")
+            return [], True
+        
         # Localiza a div principal que contém os artigos
         # O site do CNS usa uma div com id 'content-core' como container principal
         content_core = soup.find('div', id='content-core')
         if not content_core:
-            print(f"Aviso: content-core não encontrado para {ano}")
-            return []
+            print(f"  Aviso: content-core não encontrado para {ano} - Página {pagina}")
+            return [], True
         
         # Encontra todos os elementos article que representam as resoluções
         # Cada resolução é um elemento <article> com classe 'tileItem'
@@ -161,12 +192,55 @@ def coletar_dados_pagina(url: str, ano: str) -> list[dict[str, str]]:
             dados['ano'] = ano  # Adiciona o ano aos dados da resolução
             dados_artigos.append(dados)
             
-        print(f"Coletados {len(dados_artigos)} artigos de {ano}")
-        return dados_artigos
+        print(f"  Coletados {len(dados_artigos)} artigos de {ano} - Página {pagina}")
+        return dados_artigos, len(dados_artigos) == 0
         
     except Exception as e:
-        print(f"Erro ao coletar dados de {ano}: {e}")
-        return []  # Retorna lista vazia em caso de erro
+        print(f"  Erro ao coletar dados de {ano} - Página {pagina}: {e}")
+        return [], True  # Considera como página vazia em caso de erro
+
+
+def coletar_dados_ano_completo(ano: str) -> list[dict[str, str]]:
+    """
+    Coleta dados de todas as páginas de um ano específico.
+    
+    Itera através de todas as páginas de um ano, incrementando b_start
+    de 20 em 20 até encontrar uma página vazia.
+    
+    Args:
+        ano (str): Ano de referência para coleta
+        
+    Returns:
+        list[dict[str, str]]: Todos os dados coletados do ano
+    """
+    print(f"Iniciando coleta completa do ano {ano}")
+    todos_dados_ano = []
+    b_start = 0
+    pagina = 1
+    
+    while True:
+        # Gera URL da página atual
+        url = gerar_url_pagina(ano, b_start)
+        
+        # Coleta dados da página
+        dados_pagina, pagina_vazia = coletar_dados_pagina_unica(url, ano, pagina)
+        
+        # Se a página está vazia, para a iteração
+        if pagina_vazia:
+            break
+            
+        # Adiciona os dados coletados
+        todos_dados_ano.extend(dados_pagina)
+        
+        # Incrementa para próxima página
+        b_start += 20
+        pagina += 1
+        
+        # Pausa entre requisições
+        time.sleep(0.5)
+    
+    print(f"Coleta do ano {ano} concluída: {len(todos_dados_ano)} resoluções encontradas")
+    return todos_dados_ano
 
 
 def coletar_todos_dados() -> list[dict[str, str]]:
@@ -180,34 +254,30 @@ def coletar_todos_dados() -> list[dict[str, str]]:
     Returns:
         list[dict[str, str]]: Todos os dados coletados de todas as páginas
     """
-    # Gera lista de URLs de todas as páginas a serem processadas
-    urls_paginas = gerar_urls_paginas()  # Função corrigida: era generate_page_urls
+    # Gera lista de anos a serem processados
+    anos = gerar_anos()
     todos_dados = []
-    total_paginas = len(urls_paginas)
+    total_anos = len(anos)
     
-    print(f"Iniciando coleta de {total_paginas} páginas...")
+    print(f"Iniciando coleta de {total_anos} anos...")
     
-    # Processa cada página (ano) individualmente
-    for i, url in enumerate(urls_paginas, 1):
-        # Extrai o ano da URL para identificação
-        ano = url.split('/')[-1]
-        print(f"Progresso: {i}/{total_paginas} - Processando ano {ano}")
+    # Processa cada ano individualmente
+    for i, ano in enumerate(anos, 1):
+        print(f"Progresso: {i}/{total_anos} - Processando ano {ano}")
         
-        # Coleta dados da página atual
-        dados_pagina = coletar_dados_pagina(url, ano)
-        todos_dados.extend(dados_pagina)  # Adiciona os dados à lista geral
+        # Coleta dados de todas as páginas do ano
+        dados_ano = coletar_dados_ano_completo(ano)
+        todos_dados.extend(dados_ano)  # Adiciona os dados à lista geral
         
-        # Pausa respeitosa entre requisições para não sobrecarregar o servidor
-        # Isso é uma boa prática em web scraping
+        # Pausa respeitosa entre anos para não sobrecarregar o servidor
         time.sleep(1)
         
-        # Salvamento progressivo a cada 5 páginas para evitar perda de dados
-        # Em caso de erro ou interrupção, os dados não são perdidos
+        # Salvamento progressivo a cada 5 anos para evitar perda de dados
         if i % 5 == 0:
             df_temp = pd.DataFrame(todos_dados)
             df_temp.to_csv(f'cns_resolucoes_temp_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv', 
                           index=False, encoding='utf-8')
-            print(f"Salvamento temporário realizado após {i} páginas")
+            print(f"Salvamento temporário realizado após {i} anos")
     
     return todos_dados
 
@@ -441,8 +511,9 @@ def main() -> Any:
         Any: DataFrame do pandas com todos os dados coletados
     """
     print("Iniciando coleta de Resoluções do CNS...")
-    urls_paginas = gerar_urls_paginas()
-    print(f"Processará {len(urls_paginas)} páginas (anos {urls_paginas[-1].split('/')[-1]} a {urls_paginas[0].split('/')[-1]})")
+    anos = gerar_anos()
+    print(f"Processará {len(anos)} anos ({anos[-1]} a {anos[0]})")
+    print("Cada ano será processado página por página até encontrar página vazia")
     print("=" * 60)
     
     # Coleta todos os dados
@@ -458,7 +529,8 @@ def main() -> Any:
     print("\nResumo dos dados coletados:")
     print(f"Total de registros: {len(df_final)}")
     print(f"Colunas: {list(df_final.columns)}")
-    print(f"Anos com dados: {sorted(df_final['ano'].unique())}")
+    if not df_final.empty:
+        print(f"Anos com dados: {sorted(df_final['ano'].unique())}")
     
     # Salva arquivo final
     nome_arquivo_final = f'cns_resolucoes_completo_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
@@ -468,8 +540,11 @@ def main() -> Any:
     print(f"Localização: {os.path.abspath(nome_arquivo_final)}")
     
     # Mostra amostra dos dados
-    print("\nAmostra dos primeiros 3 registros:")
-    print(df_final.head(3).to_string())
+    if not df_final.empty:
+        print("\nAmostra dos primeiros 3 registros:")
+        print(df_final.head(3).to_string())
+    else:
+        print("\nNenhum dado foi coletado.")
     
     return df_final
 

@@ -1,15 +1,28 @@
 #!/usr/bin/env python3
 """
-CNS Raspador - Main CLI Interface
+CNS Raspador - Interface Principal de Linha de Comando
 
-Command line interface for scraping CNS (Conselho Nacional de Saúde) resolutions
-from the Brazilian government website.
+Interface de linha de comando para coletar resoluções do CNS (Conselho Nacional 
+de Saúde) do site oficial do governo brasileiro.
 
-Usage:
-    python main.py scrape                    # Scrape resolution data
-    python main.py download [CSV_FILE]       # Download PDFs
-    python main.py extract [CSV_FILE]        # Extract text from PDFs
-    python main.py full [CSV_FILE]           # Full pipeline (scrape + download + extract)
+Este script oferece comandos para:
+- Coletar metadados das resoluções do site do CNS
+- Baixar os arquivos PDF das resoluções
+- Extrair texto dos PDFs para análise
+- Executar todo o pipeline completo
+- Verificar o status atual dos dados
+
+Uso:
+    python main.py scrape                    # Coleta dados das resoluções
+    python main.py download [ARQUIVO_CSV]    # Baixa PDFs das resoluções
+    python main.py extract [ARQUIVO_CSV]     # Extrai texto dos PDFs
+    python main.py full                      # Pipeline completo (coletar + baixar + extrair)
+    python main.py status                    # Mostra status do projeto
+
+Exemplos:
+    python main.py scrape                    # Inicia coleta de resoluções
+    python main.py download resolucoes.csv   # Baixa PDFs do arquivo especificado
+    python main.py full                      # Executa processo completo
 """
 
 import argparse
@@ -20,206 +33,356 @@ from pathlib import Path
 # Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.scraper import main as scraper_main, download_all_pdfs
-from src.text_extractor import main as extractor_main, create_complete_database_with_texts
+from src.scraper import main as scraper_main, baixar_todos_pdfs
+from src.text_extractor import criar_base_completa_com_textos
 import glob
 
 
-def find_latest_csv(pattern="cns_resolucoes_*.csv", exclude_patterns=None):
-    """Find the most recent CSV file matching pattern."""
-    if exclude_patterns is None:
-        exclude_patterns = ['teste', 'com_textos', 'temp']
+def encontrar_csv_mais_recente(padrao="cns_resolucoes_*.csv", padroes_exclusao=None):
+    """
+    Encontra o arquivo CSV mais recente que corresponde ao padrão especificado.
     
-    csv_files = glob.glob(pattern)
-    csv_files = [f for f in csv_files if not any(excl in f for excl in exclude_patterns)]
+    Esta função é útil para automaticamente usar o arquivo CSV mais recente
+    quando o usuário não especifica um arquivo específico.
     
-    if not csv_files:
+    Args:
+        padrao (str): Padrão glob para buscar arquivos CSV
+        padroes_exclusao (list): Lista de padrões a excluir da busca
+        
+    Returns:
+        str: Caminho para o arquivo CSV mais recente, ou None se nenhum for encontrado
+    """
+    if padroes_exclusao is None:
+        padroes_exclusao = ['teste', 'com_textos', 'temp']
+    
+    arquivos_csv = glob.glob(padrao)
+    arquivos_csv = [f for f in arquivos_csv if not any(excl in f for excl in padroes_exclusao)]
+    
+    if not arquivos_csv:
         return None
     
-    return max(csv_files, key=os.path.getctime)
+    return max(arquivos_csv, key=os.path.getctime)
 
 
-def cmd_scrape(args):
-    """Execute scraping command."""
-    print("🕷️ Starting CNS resolution scraping...")
-    df_result = scraper_main()
-    if df_result is not None:
-        print("✅ Scraping completed successfully!")
+def cmd_coletar(_args):
+    """
+    Executa o comando de coleta de dados das resoluções.
+    
+    Este comando acessa o site oficial do CNS e coleta todos os metadados
+    das resoluções disponíveis, salvando em um arquivo CSV.
+    
+    Args:
+        _args: Argumentos da linha de comando (não utilizados neste comando)
+        
+    Returns:
+        bool: True se a coleta foi bem-sucedida, False caso contrário
+    """
+    del _args  # Suprime aviso de variável não utilizada
+    print("🕷️ Iniciando coleta de metadados das resoluções CNS...")
+    df_resultado = scraper_main()
+    if df_resultado is not None:
+        print("✅ Coleta concluída com sucesso!")
         return True
     else:
-        print("❌ Scraping failed!")
+        print("❌ Coleta falhou!")
         return False
 
 
-def cmd_download(args):
-    """Execute PDF download command."""
-    csv_file = args.csv_file
+def cmd_baixar(args):
+    """
+    Executa o comando de download dos arquivos PDF das resoluções.
     
-    if not csv_file:
-        csv_file = find_latest_csv()
-        if not csv_file:
-            print("❌ No CSV file found! Run scraping first or specify a CSV file.")
+    Este comando lê um arquivo CSV com dados das resoluções e baixa
+    os arquivos PDF correspondentes, organizando-os por ano.
+    
+    Args:
+        args: Argumentos da linha de comando contendo:
+              - csv_file: Caminho para arquivo CSV (opcional)
+              
+    Returns:
+        bool: True se o download foi bem-sucedido, False caso contrário
+    """
+    arquivo_csv = args.csv_file
+    
+    if not arquivo_csv:
+        arquivo_csv = encontrar_csv_mais_recente()
+        if not arquivo_csv:
+            print("❌ Nenhum arquivo CSV encontrado!")
+            print("   Dica: Execute 'python main.py scrape' primeiro ou especifique um arquivo CSV.")
             return False
-        print(f"📁 Using latest CSV file: {csv_file}")
+        print(f"📁 Usando o arquivo CSV mais recente: {arquivo_csv}")
     
-    if not os.path.exists(csv_file):
-        print(f"❌ CSV file not found: {csv_file}")
+    if not os.path.exists(arquivo_csv):
+        print(f"❌ Arquivo CSV não encontrado: {arquivo_csv}")
         return False
     
-    print(f"📥 Starting PDF download from: {csv_file}")
-    result = download_all_pdfs(csv_file, skip_existing=True)
+    print(f"📥 Iniciando download de PDFs de: {arquivo_csv}")
+    resultado = baixar_todos_pdfs(arquivo_csv, pular_existentes=True)
     
-    if result and result['successes'] > 0:
-        print("✅ PDF download completed successfully!")
+    if resultado and isinstance(resultado, dict) and isinstance(resultado.get('sucessos', 0), int) and resultado['sucessos'] > 0:
+        print("✅ Download de PDFs concluído com sucesso!")
         return True
     else:
-        print("❌ PDF download failed!")
+        print("❌ Download de PDFs falhou!")
         return False
 
 
-def cmd_extract(args):
-    """Execute text extraction command."""
-    csv_file = args.csv_file
+def cmd_extrair(args):
+    """
+    Executa o comando de extração de texto dos PDFs baixados.
     
-    if not csv_file:
-        csv_file = find_latest_csv()
-        if not csv_file:
-            print("❌ No CSV file found! Run scraping first or specify a CSV file.")
+    Este comando processa todos os arquivos PDF baixados, extrai o texto
+    de cada um e combina com os metadados das resoluções, gerando uma
+    base de dados completa.
+    
+    Args:
+        args: Argumentos da linha de comando contendo:
+              - csv_file: Caminho para arquivo CSV (opcional)
+              
+    Returns:
+        bool: True se a extração foi bem-sucedida, False caso contrário
+    """
+    arquivo_csv = args.csv_file
+    
+    if not arquivo_csv:
+        arquivo_csv = encontrar_csv_mais_recente()
+        if not arquivo_csv:
+            print("❌ Nenhum arquivo CSV encontrado!")
+            print("   Dica: Execute 'python main.py scrape' primeiro ou especifique um arquivo CSV.")
             return False
-        print(f"📁 Using latest CSV file: {csv_file}")
+        print(f"📁 Usando o arquivo CSV mais recente: {arquivo_csv}")
     
-    if not os.path.exists(csv_file):
-        print(f"❌ CSV file not found: {csv_file}")
+    if not os.path.exists(arquivo_csv):
+        print(f"❌ Arquivo CSV não encontrado: {arquivo_csv}")
         return False
     
-    print(f"📄 Starting text extraction from: {csv_file}")
-    df_result = create_complete_database_with_texts(csv_file)
+    print(f"📄 Iniciando extração de texto de: {arquivo_csv}")
+    df_resultado = criar_base_completa_com_textos(arquivo_csv)
     
-    if df_result is not None:
-        print("✅ Text extraction completed successfully!")
+    if df_resultado is not None:
+        print("✅ Extração de texto concluída com sucesso!")
         return True
     else:
-        print("❌ Text extraction failed!")
+        print("❌ Extração de texto falhou!")
         return False
 
 
-def cmd_full(args):
-    """Execute full pipeline."""
-    print("🚀 Starting full CNS resolution processing pipeline...")
+def cmd_completo(args):
+    """
+    Executa o pipeline completo de processamento das resoluções CNS.
+    
+    Este comando executa sequencialmente:
+    1. Coleta de dados das resoluções do site oficial
+    2. Download dos arquivos PDF das resoluções
+    3. Extração de texto dos PDFs e combinação com metadados
+    
+    É a forma mais conveniente de obter uma base completa de dados.
+    
+    Args:
+        args: Argumentos da linha de comando
+        
+    Returns:
+        bool: True se todo o pipeline foi executado com sucesso, False caso contrário
+    """
+    print("🚀 Iniciando pipeline completo de processamento de resoluções CNS...")
     print("=" * 60)
     
-    # Step 1: Scraping
-    print("📊 STEP 1: Scraping resolution data...")
-    if not cmd_scrape(args):
+    # PASSO 1: Coleta de metadados
+    print("📊 PASSO 1: Coletando metadados das resoluções...")
+    if not cmd_coletar(args):
         return False
     
-    # Find the CSV file created by scraping
-    csv_file = find_latest_csv()
-    if not csv_file:
-        print("❌ Could not find scraped CSV file!")
+    # Encontra o arquivo CSV criado pela coleta
+    arquivo_csv = encontrar_csv_mais_recente()
+    if not arquivo_csv:
+        print("❌ Não foi possível encontrar o arquivo CSV recém coletado!")
+        print("   Verifique se a coleta foi concluída com sucesso.")
         return False
     
-    # Step 2: Download PDFs
-    print(f"\n📥 STEP 2: Downloading PDFs...")
-    args.csv_file = csv_file  # Set CSV file for download
-    if not cmd_download(args):
+    # PASSO 2: Download dos arquivos PDF
+    print(f"\n📥 PASSO 2: Baixando arquivos PDF das resoluções...")
+    args.csv_file = arquivo_csv  # Define arquivo CSV para as etapas seguintes
+    if not cmd_baixar(args):
         return False
     
-    # Step 3: Extract texts
-    print(f"\n📄 STEP 3: Extracting texts from PDFs...")
-    if not cmd_extract(args):
+    # PASSO 3: Extração de texto dos PDFs
+    print(f"\n📄 PASSO 3: Extraindo texto dos PDFs e criando base completa...")
+    if not cmd_extrair(args):
         return False
     
-    print("\n🎉 Full pipeline completed successfully!")
-    print("Your complete CNS resolution database is ready!")
+    print("\n🎉 Pipeline completo concluído com sucesso!")
+    print("📊 Sua base completa de resoluções CNS está pronta para uso!")
+    print("📁 Verifique os arquivos gerados no diretório atual.")
     return True
 
 
-def cmd_status(args):
-    """Show current project status."""
-    print("📊 CNS Raspador Project Status")
+def cmd_status(_args):
+    """
+    Mostra o status atual do projeto CNS Raspador.
+    
+    Este comando examina o diretório atual e mostra informações sobre:
+    - Arquivos CSV de resoluções coletadas
+    - Arquivos PDF baixados (total e distribuição por ano)
+    - Arquivos de extração de texto processados
+    
+    Útil para verificar o progresso e entender o estado atual dos dados.
+    
+    Args:
+        _args: Argumentos da linha de comando (não utilizados neste comando)
+    """
+    del _args  # Suprime aviso de variável não utilizada
+    print("📊 Status do Projeto CNS Raspador")
     print("=" * 40)
     
-    # Check for CSV files
-    csv_files = glob.glob("cns_resolucoes_*.csv")
-    if csv_files:
-        print(f"📄 CSV files found: {len(csv_files)}")
-        latest = find_latest_csv()
-        if latest:
-            print(f"   Latest: {latest}")
+    # Verificar arquivos CSV
+    arquivos_csv = glob.glob("cns_resolucoes_*.csv")
+    if arquivos_csv:
+        print(f"📄 Arquivos CSV encontrados: {len(arquivos_csv)}")
+        mais_recente = encontrar_csv_mais_recente()
+        if mais_recente:
+            print(f"   Mais recente: {mais_recente}")
     else:
-        print("📄 No CSV files found")
+        print("📄 Nenhum arquivo CSV de resoluções encontrado")
+        print("   Execute 'python main.py scrape' para coletar os dados")
     
-    # Check for PDFs
-    pdf_folder = Path("pdfs_cns_resolucoes")
-    if pdf_folder.exists():
-        total_pdfs = len(list(pdf_folder.glob("**/*.pdf")))
-        print(f"📁 PDFs downloaded: {total_pdfs}")
+    # Verificar PDFs
+    pasta_pdfs = Path("pdfs_cns_resolucoes")
+    if pasta_pdfs.exists():
+        total_pdfs = len(list(pasta_pdfs.glob("**/*.pdf")))
+        print(f"📁 PDFs baixados: {total_pdfs}")
         
-        # Count by year
-        year_folders = [f for f in pdf_folder.iterdir() if f.is_dir()]
-        if year_folders:
-            print("   Distribution by year:")
-            for year_folder in sorted(year_folders):
-                count = len(list(year_folder.glob("*.pdf")))
-                print(f"     {year_folder.name}: {count} PDFs")
+        # Contar por ano
+        pastas_ano = [f for f in pasta_pdfs.iterdir() if f.is_dir()]
+        if pastas_ano:
+            print("   Distribuição por ano:")
+            for pasta_ano in sorted(pastas_ano):
+                quantidade = len(list(pasta_ano.glob("*.pdf")))
+                print(f"     {pasta_ano.name}: {quantidade} PDFs")
     else:
-        print("📁 No PDF folder found")
+        print("📁 Nenhuma pasta de PDFs encontrada")
+        print("   Execute 'python main.py download' para baixar os PDFs")
     
-    # Check for text extraction results
-    text_files = glob.glob("cns_resolucoes_com_textos_*.csv")
-    if text_files:
-        print(f"📝 Text extraction files: {len(text_files)}")
-        latest_text = max(text_files, key=os.path.getctime)
-        print(f"   Latest: {latest_text}")
+    # Verificar resultados de extração de texto
+    arquivos_texto = glob.glob("cns_resolucoes_com_textos_*.csv")
+    if arquivos_texto:
+        print(f"📝 Arquivos de extração de texto: {len(arquivos_texto)}")
+        texto_mais_recente = max(arquivos_texto, key=os.path.getctime)
+        print(f"   Mais recente: {texto_mais_recente}")
     else:
-        print("📝 No text extraction files found")
+        print("📝 Nenhum arquivo com texto extraído encontrado")
+        print("   Execute 'python main.py extract' para processar os PDFs")
 
 
 def main():
-    """Main CLI function."""
+    """
+    Função principal da interface de linha de comando.
+    
+    Configura o parser de argumentos, define todos os subcomandos disponíveis
+    e executa o comando solicitado pelo usuário.
+    
+    Os comandos disponíveis são:
+    - scrape: Coleta dados das resoluções
+    - download: Baixa arquivos PDF
+    - extract: Extrai texto dos PDFs
+    - full: Executa pipeline completo
+    - status: Mostra status do projeto
+    """
     parser = argparse.ArgumentParser(
-        description="CNS Raspador - Brazilian National Health Council Resolution Scraper",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="CNS Raspador - Ferramenta completa para coleta e processamento de resoluções do Conselho Nacional de Saúde",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemplos de uso:
+  python main.py scrape                  # Coleta dados das resoluções
+  python main.py download                # Baixa PDFs (usa CSV mais recente)
+  python main.py extract resolucoes.csv # Extrai texto do arquivo especificado
+  python main.py full                    # Executa processo completo
+  python main.py status                  # Verifica status atual
+
+Para mais informações sobre cada comando, use: python main.py <comando> --help
+        """
     )
     
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    subparsers = parser.add_subparsers(
+        dest='command', 
+        help='Comandos disponíveis',
+        metavar='COMANDO',
+        description='Use um dos comandos abaixo para executar ações específicas'
+    )
     
-    # Scrape command
-    scrape_parser = subparsers.add_parser('scrape', help='Scrape resolution data from CNS website')
+    # Comando de coleta
+    parser_scrape = subparsers.add_parser(
+        'scrape', 
+        help='Coleta metadados das resoluções do site oficial do CNS',
+        description='Acessa o site oficial do CNS e coleta informações sobre todas as resoluções disponíveis'
+    )
     
-    # Download command
-    download_parser = subparsers.add_parser('download', help='Download PDF files')
-    download_parser.add_argument('csv_file', nargs='?', help='CSV file with resolution data (optional, uses latest if not specified)')
+    # Comando de download
+    parser_download = subparsers.add_parser(
+        'download', 
+        help='Baixa os arquivos PDF das resoluções',
+        description='Baixa todos os arquivos PDF das resoluções listadas no arquivo CSV, organizando por ano'
+    )
+    parser_download.add_argument(
+        'csv_file', 
+        nargs='?', 
+        help='Arquivo CSV com dados das resoluções (opcional - usa o mais recente se não especificado)',
+        metavar='ARQUIVO_CSV'
+    )
     
-    # Extract command
-    extract_parser = subparsers.add_parser('extract', help='Extract text from downloaded PDFs')
-    extract_parser.add_argument('csv_file', nargs='?', help='CSV file with resolution data (optional, uses latest if not specified)')
+    # Comando de extração
+    parser_extrair = subparsers.add_parser(
+        'extract', 
+        help='Extrai texto dos PDFs baixados e cria base completa',
+        description='Processa todos os PDFs baixados, extrai o texto e combina com os metadados das resoluções'
+    )
+    parser_extrair.add_argument(
+        'csv_file', 
+        nargs='?', 
+        help='Arquivo CSV com dados das resoluções (opcional - usa o mais recente se não especificado)',
+        metavar='ARQUIVO_CSV'
+    )
     
-    # Full pipeline command
-    full_parser = subparsers.add_parser('full', help='Run complete pipeline (scrape + download + extract)')
+    # Comando de pipeline completo
+    parser_full = subparsers.add_parser(
+        'full', 
+        help='Executa o pipeline completo (coletar + baixar + extrair)',
+        description='Executa automaticamente todo o processo: coleta de dados, download de PDFs e extração de texto'
+    )
     
-    # Status command
-    status_parser = subparsers.add_parser('status', help='Show project status')
+    # Comando de status
+    parser_status = subparsers.add_parser(
+        'status', 
+        help='Mostra o status atual do projeto',
+        description='Examina os arquivos do projeto e mostra estatísticas sobre dados coletados, PDFs baixados e texto extraído'
+    )
     
-    # Parse arguments
+    # Processa os argumentos da linha de comando
     args = parser.parse_args()
     
     if not args.command:
         parser.print_help()
         return
     
-    # Execute command
-    commands = {
-        'scrape': cmd_scrape,
-        'download': cmd_download,
-        'extract': cmd_extract,
-        'full': cmd_full,
-        'status': cmd_status
+    # Mapeia comandos para suas respectivas funções
+    comandos = {
+        'scrape': cmd_coletar,      # Coleta de dados
+        'download': cmd_baixar,     # Download de PDFs
+        'extract': cmd_extrair,     # Extração de texto
+        'full': cmd_completo,       # Pipeline completo
+        'status': cmd_status        # Status do projeto
     }
     
-    success = commands[args.command](args)
-    sys.exit(0 if success else 1)
+    # Executa o comando selecionado
+    try:
+        sucesso = comandos[args.command](args)
+        sys.exit(0 if sucesso else 1)
+    except KeyboardInterrupt:
+        print("\n\n❌ Operação interrompida pelo usuário")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Erro inesperado: {e}")
+        print("Execute 'python main.py status' para verificar o estado atual")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

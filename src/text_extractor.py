@@ -1,11 +1,22 @@
 """
-Text Extraction Module
+Módulo de Extração de Texto
 
-This module handles PDF text extraction from downloaded CNS resolution files
-and combines the extracted text with the scraped metadata.
+Este módulo é responsável por:
+1. Extrair texto de arquivos PDF das resoluções do CNS baixadas usando múltiplas estratégias
+2. Combinar o texto extraído com os metadados coletados
+3. Criar uma base de dados completa com resoluções e seus respectivos textos
+
+Fluxo de trabalho:
+- Processa todos os PDFs em pastas organizadas por ano
+- Tenta extrair texto de cada PDF com a seguinte ordem de preferência:
+  1. PyMuPDF (fitz): Rápido e robusto para a maioria dos PDFs.
+  2. pdfplumber: Bom para PDFs com layouts complexos.
+  3. PyPDF2: Fallback para casos mais simples.
+  4. OCR (Tesseract): Último recurso para PDFs baseados em imagem (escaneados).
+- Faz a correspondência entre os PDFs e os dados das resoluções
+- Gera um arquivo CSV final com todos os dados unificados
 """
 
-import pdfplumber
 import pandas as pd
 import time
 from datetime import datetime
@@ -13,468 +24,488 @@ import unicodedata
 from pathlib import Path
 import glob
 import os
+import warnings
+import shutil
 
+# Variável global para verificar a disponibilidade do Tesseract
+TESSERACT_DISPONIVEL = False
 
-def install_pdfplumber():
-    """Install pdfplumber if not available."""
-    try:
-        import pdfplumber
-        print("pdfplumber already installed ✓")
+def _check_tesseract():
+    """Verifica se o executável do Tesseract está disponível no PATH."""
+    global TESSERACT_DISPONIVEL
+    if shutil.which("tesseract"):
+        TESSERACT_DISPONIVEL = True
         return True
-    except ImportError:
-        print("Installing pdfplumber...")
-        import subprocess
-        import sys
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "pdfplumber"])
-            import pdfplumber
-            print("pdfplumber installed successfully ✓")
-            return True
-        except Exception as e:
-            print(f"Error installing pdfplumber: {e}")
-            return False
+    else:
+        TESSERACT_DISPONIVEL = False
+        print("--------------------------------------------------------------------")
+        print("AVISO: Tesseract OCR não encontrado no seu sistema.")
+        print("A extração de texto de PDFs baseados em imagem (escaneados) será pulada.")
+        print("Para habilitar o OCR, instale o Tesseract:")
+        print("  - No Ubuntu/Debian: sudo apt-get install tesseract-ocr tesseract-ocr-por")
+        print("  - No Windows: baixe em https://github.com/UB-Mannheim/tesseract/wiki")
+        print("  - No macOS: brew install tesseract")
+        print("--------------------------------------------------------------------")
+        time.sleep(3) # Pausa para o usuário ler o aviso
+        return False
 
-
-def clean_filename_for_matching(title, max_length=100):
+def instalar_bibliotecas_pdf():
     """
-    Clean title to create a valid filename for matching.
+    Instala as bibliotecas necessárias para extração de texto PDF.
+    """
+    import subprocess
+    import sys
     
-    Args:
-        title (str): Original title
-        max_length (int): Maximum filename length
+    bibliotecas = {
+        "PyMuPDF": "fitz",
+        "pdfplumber": "pdfplumber",
+        "PyPDF2": "PyPDF2",
+        "Pillow": "PIL",
+        "pytesseract": "pytesseract"
+    }
+    
+    bibliotecas_instaladas = []
+    
+    for lib_install, lib_import in bibliotecas.items():
+        try:
+            __import__(lib_import)
+            print(f"{lib_install} já instalado ✓")
+            bibliotecas_instaladas.append(lib_install)
+        except ImportError:
+            print(f"Instalando {lib_install}...")
+            try:
+                # Usando uv, se disponível, para acelerar a instalação
+                pip_command = "uv pip install" if shutil.which("uv") else f"{sys.executable} -m pip install"
+                subprocess.check_call(f"{pip_command} {lib_install}", shell=True)
+                __import__(lib_import)
+                print(f"{lib_install} instalado com sucesso ✓")
+                bibliotecas_instaladas.append(lib_install)
+            except Exception as e:
+                print(f"❌ Erro ao instalar {lib_install}: {e}")
+
+    _check_tesseract()
+
+    if "PyMuPDF" in bibliotecas_instaladas or "pdfplumber" in bibliotecas_instaladas:
+        print(f"Bibliotecas PDF disponíveis: {', '.join(bibliotecas_instaladas)}")
+        return True
+    else:
+        print("❌ Nenhuma biblioteca PDF principal (PyMuPDF ou pdfplumber) pôde ser instalada!")
+        return False
+
+# Chamar a instalação no início para garantir que tudo está pronto
+instalar_bibliotecas_pdf()
+
+# Importações que dependem da instalação
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
+
+try:
+    import PyPDF2
+except ImportError:
+    PyPDF2 = None
+
+try:
+    from PIL import Image
+    import pytesseract
+except ImportError:
+    Image = None
+    pytesseract = None
+
+
+def verificar_integridade_pdf(caminho_pdf):
+    """Verifica se um arquivo PDF está íntegro e pode ser processado."""
+    try:
+        if not os.path.exists(caminho_pdf) or os.path.getsize(caminho_pdf) < 100:
+            return False, "Arquivo não existe ou é muito pequeno"
         
-    Returns:
-        str: Clean filename
+        if fitz:
+            with fitz.open(caminho_pdf) as doc:
+                if not doc.page_count:
+                    return False, "PDF sem páginas (verificado com PyMuPDF)"
+        else: # Fallback se PyMuPDF não estiver instalado
+             with pdfplumber.open(caminho_pdf) as pdf:
+                if not pdf.pages:
+                    return False, "PDF sem páginas (verificado com pdfplumber)"
+
+        return True, "PDF válido"
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "no /root object" in error_msg:
+            return False, "Arquivo corrompido (sem objeto /Root)"
+        elif "not a pdf" in error_msg:
+            return False, "Arquivo não é um PDF válido"
+        else:
+            return False, f"Erro de verificação: {str(e)[:100]}"
+
+
+def _tentar_pymupdf(caminho_pdf, max_paginas=None):
+    """Tenta extrair texto usando PyMuPDF (fitz)."""
+    if not fitz:
+        return None
+
+    try:
+        doc = fitz.open(caminho_pdf)
+        texto_completo = []
+        
+        paginas_para_processar = range(doc.page_count)
+        if max_paginas:
+            paginas_para_processar = range(min(doc.page_count, max_paginas))
+
+        for i in paginas_para_processar:
+            pagina = doc.load_page(i)
+            texto_pagina = pagina.get_text("text")
+            if texto_pagina and texto_pagina.strip():
+                texto_completo.append(texto_pagina.strip())
+        
+        doc.close()
+        
+        if texto_completo:
+            return f"SUCCESS_PYMUPDF: {' '.join(texto_completo)}"
+        return None
+    except Exception as e:
+        print(f"    - PyMuPDF falhou: {e}")
+        return None
+
+
+def _tentar_pdfplumber(caminho_pdf, max_paginas=None):
+    """Tenta extrair texto usando pdfplumber com múltiplas estratégias."""
+    if not pdfplumber:
+        return None
+
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            texto_completo = []
+            paginas_para_processar = pdf.pages
+            if max_paginas:
+                paginas_para_processar = pdf.pages[:max_paginas]
+
+            for pagina in paginas_para_processar:
+                # Estratégia 1: Padrão
+                texto_pagina = pagina.extract_text()
+                
+                # Estratégia 2: Layout
+                if not texto_pagina or len(texto_pagina.strip()) < 10:
+                    texto_pagina = pagina.extract_text(
+                        x_tolerance=3, y_tolerance=3, layout=True, 
+                        x_density=7.25, y_density=13
+                    )
+
+                if texto_pagina and texto_pagina.strip():
+                    texto_completo.append(texto_pagina.strip())
+            
+            if texto_completo:
+                return f"SUCCESS_PDFPLUMBER: {' '.join(texto_completo)}"
+        return None
+    except Exception as e:
+        print(f"    - pdfplumber falhou: {e}")
+        return None
+
+
+def _tentar_pypdf2(caminho_pdf, max_paginas=None):
+    """Tenta extrair texto usando PyPDF2 como fallback."""
+    if not PyPDF2:
+        return None
+
+    try:
+        with open(caminho_pdf, 'rb') as arquivo:
+            leitor = PyPDF2.PdfReader(arquivo)
+            texto_completo = []
+            
+            num_paginas = len(leitor.pages)
+            if max_paginas:
+                num_paginas = min(num_paginas, max_paginas)
+            
+            for i in range(num_paginas):
+                pagina = leitor.pages[i]
+                texto_pagina = pagina.extract_text()
+                if texto_pagina and texto_pagina.strip():
+                    texto_completo.append(texto_pagina.strip())
+            
+            if texto_completo:
+                return f"SUCCESS_PYPDF2: {' '.join(texto_completo)}"
+        return None
+    except Exception as e:
+        print(f"    - PyPDF2 falhou: {e}")
+        return None
+
+def _tentar_ocr(caminho_pdf, max_paginas=None):
+    """Tenta extrair texto usando OCR (Tesseract) como último recurso."""
+    if not TESSERACT_DISPONIVEL or not fitz or not Image or not pytesseract:
+        return None
+
+    try:
+        print("    - Tentando OCR (pode ser lento)...")
+        doc = fitz.open(caminho_pdf)
+        texto_completo = []
+        
+        paginas_para_processar = range(doc.page_count)
+        if max_paginas:
+            paginas_para_processar = range(min(doc.page_count, max_paginas))
+
+        for i in paginas_para_processar:
+            pagina = doc.load_page(i)
+            # Renderiza a página como imagem
+            pix = pagina.get_pixmap(dpi=300)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            
+            # Extrai texto da imagem usando Tesseract
+            texto_pagina = pytesseract.image_to_string(img, lang='por')
+            if texto_pagina and texto_pagina.strip():
+                texto_completo.append(texto_pagina.strip())
+        
+        doc.close()
+
+        if texto_completo:
+            return f"SUCCESS_OCR: {' '.join(texto_completo)}"
+        return None
+    except Exception as e:
+        print(f"    - OCR falhou: {e}")
+        return None
+
+
+def extrair_texto_do_pdf(caminho_pdf, max_paginas=None):
     """
-    if not title:
+    Extrai texto de um PDF usando uma cadeia de estratégias.
+    
+    Ordem das tentativas:
+    1. PyMuPDF (fitz)
+    2. pdfplumber
+    3. PyPDF2
+    4. OCR (Tesseract)
+    
+    Returns:
+        str: Texto extraído com um prefixo de sucesso (e.g., "SUCCESS_PYMUPDF: ")
+             ou uma mensagem de erro (e.g., "ERROR_ALL_METHODS_FAILED").
+    """
+    warnings.filterwarnings('ignore', category=UserWarning)
+    warnings.filterwarnings('ignore', message='.*invalid.*color.*')
+
+    # Estratégia 1: PyMuPDF
+    texto = _tentar_pymupdf(caminho_pdf, max_paginas)
+    if texto:
+        return texto
+
+    # Estratégia 2: pdfplumber
+    texto = _tentar_pdfplumber(caminho_pdf, max_paginas)
+    if texto:
+        return texto
+
+    # Estratégia 3: PyPDF2
+    texto = _tentar_pypdf2(caminho_pdf, max_paginas)
+    if texto:
+        return texto
+
+    # Estratégia 4: OCR
+    texto = _tentar_ocr(caminho_pdf, max_paginas)
+    if texto:
+        return texto
+
+    return "ERROR_ALL_METHODS_FAILED: Nenhuma biblioteca conseguiu extrair texto."
+
+
+def limpar_texto_extraido(texto):
+    """Limpa e normaliza o texto extraído dos PDFs."""
+    if not texto or texto.startswith("ERROR_"):
+        return texto
+    
+    # Remove o prefixo de sucesso (e.g., "SUCCESS_PYMUPDF: ")
+    if ": " in texto:
+        texto = texto.split(": ", 1)[1]
+
+    texto = unicodedata.normalize('NFKD', texto)
+    texto = ' '.join(texto.split())
+    
+    if len(texto) > 50000:
+        texto = texto[:50000] + "... [TEXTO_TRUNCADO]"
+    
+    return texto
+
+
+def processar_todos_pdfs_para_texto(pasta_pdfs="pdfs_cns_resolucoes", max_paginas_por_pdf=None):
+    """Processa todos os PDFs encontrados na pasta e extrai seus textos."""
+    pasta_base = Path(pasta_pdfs)
+    if not pasta_base.exists():
+        print(f"Pasta {pasta_pdfs} não encontrada!")
+        return {}
+    
+    todos_pdfs = list(pasta_base.glob('**/*.pdf'))
+    print(f"Encontrados {len(todos_pdfs)} PDFs para processar...")
+    
+    if not todos_pdfs:
+        return {}
+    
+    textos_extraidos = {}
+    sucessos = 0
+    erros = 0
+    
+    print("\nIniciando extração de texto dos PDFs...")
+    print("=" * 60)
+    
+    for i, caminho_pdf in enumerate(todos_pdfs, 1):
+        nome_arquivo = caminho_pdf.stem
+        ano = caminho_pdf.parent.name
+        
+        print(f"{i}/{len(todos_pdfs)} - Processando: {ano}/{nome_arquivo}")
+        
+        pdf_valido, msg_verificacao = verificar_integridade_pdf(caminho_pdf)
+        
+        if not pdf_valido:
+            print(f"  ✗ PDF inválido: {msg_verificacao}")
+            texto_bruto = f"ERROR_INVALID_PDF: {msg_verificacao}"
+            erros += 1
+        else:
+            texto_bruto = extrair_texto_do_pdf(caminho_pdf, max_paginas_por_pdf)
+            
+            if texto_bruto.startswith("ERROR_"):
+                print(f"  ✗ Erro de extração: {texto_bruto}")
+                erros += 1
+            else:
+                metodo = texto_bruto.split(':', 1)[0].replace('SUCCESS_', '')
+                tamanho = len(limpar_texto_extraido(texto_bruto))
+                print(f"  ✓ Texto extraído com {metodo}: {tamanho} caracteres")
+                sucessos += 1
+        
+        chave = f"{ano}_{nome_arquivo}"
+        texto_limpo = limpar_texto_extraido(texto_bruto)
+        textos_extraidos[chave] = {
+            'ano': ano,
+            'nome_arquivo': nome_arquivo,
+            'caminho_completo': str(caminho_pdf),
+            'texto': texto_limpo,
+            'tamanho_texto': len(texto_limpo) if not texto_limpo.startswith("ERROR_") else 0,
+            'tem_erro': texto_limpo.startswith("ERROR_"),
+            'metodo_extracao': texto_bruto.split(':', 1)[0]
+        }
+        
+        if i % 10 == 0:
+            print(f"  Progresso: {i}/{len(todos_pdfs)} - Sucessos: {sucessos}, Erros: {erros}")
+            time.sleep(0.1)
+            
+    print("=" * 60)
+    print(f"Extração concluída! Sucessos: {sucessos}, Erros: {erros}")
+    
+    # Salva resultado intermediário
+    df_textos = pd.DataFrame.from_dict(textos_extraidos, orient='index')
+    if not df_textos.empty:
+        nome_arquivo_textos = f'textos_pdfs_extraidos_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+        df_textos.to_csv(nome_arquivo_textos, index_label='chave', encoding='utf-8')
+        print(f"\nArquivo de backup salvo: {nome_arquivo_textos}")
+    
+    return textos_extraidos
+
+def limpar_nome_arquivo_para_matching(titulo, tamanho_maximo=100):
+    """Limpa o título da resolução para criar um nome de arquivo válido."""
+    if not titulo:
         return "resolucao_sem_titulo"
     
     import string
     valid_chars = "-_.() %s%s" % (string.ascii_letters, string.digits)
-    clean_title = ''.join(c for c in title if c in valid_chars)
+    titulo_limpo = ''.join(c for c in titulo if c in valid_chars)
     
-    # Remove double spaces and limit size
-    clean_title = ' '.join(clean_title.split())
-    if len(clean_title) > max_length:
-        clean_title = clean_title[:max_length]
-    
-    return clean_title
+    titulo_limpo = ' '.join(titulo_limpo.split())
+    return titulo_limpo[:tamanho_maximo]
 
 
-def extract_text_from_pdf(pdf_path, max_pages=None):
-    """
-    Extract text from a PDF file.
-    
-    Args:
-        pdf_path (str): Path to PDF file
-        max_pages (int): Maximum pages to process (None = all)
-        
-    Returns:
-        str: Extracted text from PDF
-    """
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            full_text = []
-            
-            # Process pages (limited if specified)
-            pages_to_process = pdf.pages
-            if max_pages:
-                pages_to_process = pdf.pages[:max_pages]
-            
-            for page in pages_to_process:
-                page_text = page.extract_text()
-                if page_text:
-                    full_text.append(page_text)
-            
-            # Join all text
-            final_text = '\n'.join(full_text)
-            
-            # Clean text (remove excessive breaks, etc.)
-            final_text = ' '.join(final_text.split())
-            
-            return final_text
-            
-    except Exception as e:
-        return f"EXTRACTION_ERROR: {str(e)}"
-
-
-def clean_extracted_text(text):
-    """
-    Clean and normalize extracted text from PDFs.
-    
-    Args:
-        text (str): Raw extracted text
-        
-    Returns:
-        str: Cleaned text
-    """
-    if not text or text.startswith("EXTRACTION_ERROR"):
-        return text
-    
-    # Remove problematic special characters
-    text = unicodedata.normalize('NFKD', text)
-    
-    # Remove excessive line breaks
-    text = ' '.join(text.split())
-    
-    # Limit size if necessary (to not explode CSV)
-    if len(text) > 50000:  # 50k chars max
-        text = text[:50000] + "... [TEXT_TRUNCATED]"
-    
-    return text
-
-
-def process_all_pdfs_to_text(pdf_folder="pdfs_cns_resolucoes", max_pages_per_pdf=None):
-    """
-    Process all PDFs in folder and extract their texts.
-    
-    Args:
-        pdf_folder (str): Folder containing PDFs organized by year
-        max_pages_per_pdf (int): Maximum pages per PDF (None = all)
-        
-    Returns:
-        dict: {filename: extracted_text_info}
-    """
-    if not install_pdfplumber():
-        return {}
-        
-    base_folder = Path(pdf_folder)
-    
-    if not base_folder.exists():
-        print(f"Folder {pdf_folder} not found!")
-        return {}
-    
-    # Find all PDFs
-    all_pdfs = list(base_folder.glob('**/*.pdf'))
-    print(f"Found {len(all_pdfs)} PDFs to process...")
-    
-    if not all_pdfs:
-        print("No PDFs found!")
-        return {}
-    
-    extracted_texts = {}
-    successes = 0
-    errors = 0
-    
-    print("Starting text extraction from PDFs...")
-    print("=" * 60)
-    
-    for i, pdf_path in enumerate(all_pdfs, 1):
-        try:
-            # Filename (without extension) to use as key
-            filename = pdf_path.stem
-            year = pdf_path.parent.name
-            
-            print(f"{i}/{len(all_pdfs)} - Processing: {year}/{filename}")
-            
-            # Extract text
-            text = extract_text_from_pdf(pdf_path, max_pages_per_pdf)
-            clean_text = clean_extracted_text(text)
-            
-            # Unique key: year_filename
-            key = f"{year}_{filename}"
-            extracted_texts[key] = {
-                'year': year,
-                'filename': filename,
-                'full_path': str(pdf_path),
-                'text': clean_text,
-                'text_size': len(clean_text),
-                'has_error': clean_text.startswith("EXTRACTION_ERROR")
-            }
-            
-            if clean_text.startswith("EXTRACTION_ERROR"):
-                print(f"  ✗ Extraction error: {clean_text[:100]}...")
-                errors += 1
-            else:
-                print(f"  ✓ Text extracted: {len(clean_text)} characters")
-                successes += 1
-            
-            # Small pause to not overload
-            if i % 10 == 0:
-                print(f"  Progress: {i}/{len(all_pdfs)} - Successes: {successes}, Errors: {errors}")
-                time.sleep(0.1)
-                
-        except Exception as e:
-            print(f"  ✗ Unexpected error: {e}")
-            errors += 1
-            
-            # Still save error entry
-            filename = pdf_path.stem
-            year = pdf_path.parent.name
-            key = f"{year}_{filename}"
-            
-            extracted_texts[key] = {
-                'year': year,
-                'filename': filename,
-                'full_path': str(pdf_path),
-                'text': f"EXTRACTION_ERROR: {str(e)}",
-                'text_size': 0,
-                'has_error': True
-            }
-    
-    print("=" * 60)
-    print(f"Extraction completed!")
-    print(f"PDFs processed: {len(all_pdfs)}")
-    print(f"Successes: {successes}")
-    print(f"Errors: {errors}")
-    print(f"Total texts collected: {len(extracted_texts)}")
-    
-    # Save intermediate result
-    texts_filename = f'textos_pdfs_extraidos_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-    
-    # Convert to DataFrame to save
-    text_data = []
-    for key, info in extracted_texts.items():
-        text_data.append({
-            'key': key,
-            'year': info['year'],
-            'filename': info['filename'],
-            'full_path': info['full_path'],
-            'text_size': info['text_size'],
-            'has_error': info['has_error'],
-            'text': info['text']
-        })
-    
-    df_texts = pd.DataFrame(text_data)
-    df_texts.to_csv(texts_filename, index=False, encoding='utf-8')
-    print(f"Texts saved to: {texts_filename}")
-    
-    return extracted_texts
-
-
-def combine_csv_with_pdf_texts(csv_file, extracted_texts=None, pdf_folder="pdfs_cns_resolucoes"):
-    """
-    Combine CSV resolution data with PDF texts.
-    
-    Args:
-        csv_file (str): Path to CSV with resolution data
-        extracted_texts (dict): Dict with already extracted texts (or None to extract)
-        pdf_folder (str): Folder with PDFs (if need to extract)
-        
-    Returns:
-        DataFrame: DataFrame with new 'pdf_text' column
-    """
-    # Load resolution data
-    if not os.path.exists(csv_file):
-        print(f"CSV file not found: {csv_file}")
+def combinar_csv_com_textos_pdf(arquivo_csv, textos_extraidos, pasta_pdfs="pdfs_cns_resolucoes"):
+    """Combina os dados das resoluções (CSV) com os textos extraídos dos PDFs."""
+    if not os.path.exists(arquivo_csv):
+        print(f"Arquivo CSV não encontrado: {arquivo_csv}")
         return None
     
-    df_resolutions = pd.read_csv(csv_file)
-    print(f"Loaded CSV with {len(df_resolutions)} resolutions")
+    df_resolucoes = pd.read_csv(arquivo_csv)
+    print(f"CSV carregado com {len(df_resolucoes)} resoluções")
     
-    # If texts not provided, extract now
-    if extracted_texts is None:
-        print("Texts not provided, extracting from PDFs...")
-        extracted_texts = process_all_pdfs_to_text(pdf_folder)
+    if not textos_extraidos:
+        print("Dicionário de textos extraídos está vazio. Abortando combinação.")
+        return df_resolucoes
+
+    df_textos = pd.DataFrame.from_dict(textos_extraidos, orient='index')
+    df_textos.index.name = 'chave_pdf'
     
-    print(f"Available {len(extracted_texts)} PDF texts")
-    
-    # Add text columns
-    df_resolutions['pdf_text'] = ''
-    df_resolutions['pdf_text_size'] = 0
-    df_resolutions['pdf_extraction_error'] = False
-    
-    # Counters for statistics
-    matches_found = 0
-    matches_not_found = 0
-    
-    print("Starting matching between CSV and PDF texts...")
-    print("=" * 60)
-    
-    counter = 0
-    for idx, row in df_resolutions.iterrows():
-        counter += 1
-        try:
-            # Try different matching strategies
-            original_title = row.get('titulo', '')
-            year = row.get('ano', '')
-            
-            # Clean title to create filename
-            expected_filename = clean_filename_for_matching(original_title)
-            
-            # Possible keys to search
-            possible_keys = [
-                f"{year}_{expected_filename}",  # Standard format
-                f"{year}_{original_title}",     # Original title
-                expected_filename,              # Just the name
-                original_title                  # Just original title
-            ]
-            
-            # Try to find text
-            found_text = None
-            used_key = None
-            
-            for possible_key in possible_keys:
-                if possible_key in extracted_texts:
-                    found_text = extracted_texts[possible_key]
-                    used_key = possible_key
-                    break
-            
-            # If not found, try partial matching (more flexible)
-            if not found_text:
-                for key, info in extracted_texts.items():
-                    # Check if filename is contained in title or vice versa
-                    if (expected_filename.lower() in key.lower() or 
-                        key.lower() in expected_filename.lower() or
-                        (info['year'] == str(year) and 
-                         any(word in info['filename'].lower() 
-                             for word in expected_filename.lower().split()[:3]))):
-                        
-                        found_text = info
-                        used_key = key
-                        break
-            
-            # Update DataFrame
-            if found_text:
-                df_resolutions.at[idx, 'pdf_text'] = found_text['text']
-                df_resolutions.at[idx, 'pdf_text_size'] = found_text['text_size']
-                df_resolutions.at[idx, 'pdf_extraction_error'] = found_text['has_error']
-                matches_found += 1
-                
-                if counter % 50 == 0:  # Log every 50 records
-                    print(f"  {counter}/{len(df_resolutions)} - Match: {used_key}")
-            else:
-                df_resolutions.at[idx, 'pdf_text'] = 'PDF_NOT_FOUND'
-                df_resolutions.at[idx, 'pdf_text_size'] = 0
-                df_resolutions.at[idx, 'pdf_extraction_error'] = True
-                matches_not_found += 1
-                
-                if counter % 50 == 0:
-                    print(f"  {counter}/{len(df_resolutions)} - Not found: {expected_filename}")
-                
-        except Exception as e:
-            print(f"Error processing row {counter}: {e}")
-            df_resolutions.at[idx, 'pdf_text'] = f'PROCESSING_ERROR: {str(e)}'
-            df_resolutions.at[idx, 'pdf_text_size'] = 0
-            df_resolutions.at[idx, 'pdf_extraction_error'] = True
-            matches_not_found += 1
+    # Prepara as chaves no DataFrame de resoluções
+    df_resolucoes['chave_pdf'] = df_resolucoes.apply(
+        lambda row: f"{row['ano']}_{limpar_nome_arquivo_para_matching(row['titulo'])}",
+        axis=1
+    )
+
+    # Merge exato
+    df_completo = pd.merge(df_resolucoes, df_textos, on='chave_pdf', how='left')
     
     print("=" * 60)
-    print("MATCHING COMPLETED!")
-    print(f"Total resolutions: {len(df_resolutions)}")
-    print(f"Matches found: {matches_found}")
-    print(f"Matches not found: {matches_not_found}")
-    print(f"Success rate: {matches_found/len(df_resolutions)*100:.1f}%")
+    print("CORRESPONDÊNCIA CONCLUÍDA!")
+    sucessos = df_completo['texto'].notna().sum()
+    print(f"Correspondências diretas encontradas: {sucessos}/{len(df_completo)}")
     
-    # Text statistics
-    texts_with_content = df_resolutions[
-        (df_resolutions['pdf_text'] != 'PDF_NOT_FOUND') & 
-        (~df_resolutions['pdf_text'].str.startswith('ERROR_')) &
-        (df_resolutions['pdf_text_size'] > 0)
-    ]
-    
-    if len(texts_with_content) > 0:
-        print(f"\nExtracted text statistics:")
-        print(f"Texts with content: {len(texts_with_content)}")
-        print(f"Average size: {texts_with_content['pdf_text_size'].mean():.0f} characters")
-        print(f"Min size: {texts_with_content['pdf_text_size'].min()}")
-        print(f"Max size: {texts_with_content['pdf_text_size'].max()}")
-    
-    return df_resolutions
+    return df_completo
 
 
-def create_complete_database_with_texts(csv_file=None, pdf_folder="pdfs_cns_resolucoes", max_pages_per_pdf=None):
-    """
-    Main function that creates complete database with PDF texts.
-    
-    Args:
-        csv_file (str): Base CSV file (or None to use most recent)
-        pdf_folder (str): Folder with PDFs
-        max_pages_per_pdf (int): Page limit per PDF
-        
-    Returns:
-        DataFrame: Complete database with texts
-    """
-    # Find CSV file if not specified
-    if csv_file is None:
-        csv_files = glob.glob('cns_resolucoes_*.csv')
-        csv_files = [f for f in csv_files if 'teste' not in f and 'com_textos' not in f]
-        
-        if not csv_files:
-            print("No CSV resolution files found!")
-            print("Run first the resolution data collection script.")
+def criar_base_completa_com_textos(arquivo_csv=None, pasta_pdfs="pdfs_cns_resolucoes", max_paginas_por_pdf=None):
+    """Função principal que cria a base de dados completa com textos dos PDFs."""
+    if arquivo_csv is None:
+        arquivos_csv = [f for f in glob.glob('cns_resolucoes_*.csv') if 'com_textos' not in f]
+        if not arquivos_csv:
+            print("Nenhum arquivo CSV de resoluções encontrado!")
             return None
+        arquivo_csv = max(arquivos_csv, key=os.path.getctime)
+        print(f"Usando arquivo CSV mais recente: {arquivo_csv}")
+    
+    print("=" * 60)
+    print("CRIANDO BASE COMPLETA COM TEXTOS PDF")
+    print("=" * 60)
+    
+    inicio_extracao = time.time()
+    textos_extraidos = processar_todos_pdfs_para_texto(pasta_pdfs, max_paginas_por_pdf)
+    
+    if not textos_extraidos:
+        print("❌ Nenhum texto extraído. Verifique a pasta de PDFs.")
+        return None
+    
+    print(f"✅ Extração concluída em {time.time() - inicio_extracao:.2f} segundos")
+    
+    inicio_combinacao = time.time()
+    df_completo = combinar_csv_com_textos_pdf(arquivo_csv, textos_extraidos)
+    
+    if df_completo is None:
+        print("❌ Erro na combinação de dados.")
+        return None
         
-        csv_file = max(csv_files, key=os.path.getctime)
-        print(f"Using CSV file: {csv_file}")
+    print(f"✅ Combinação concluída em {time.time() - inicio_combinacao:.2f} segundos")
+
+    nome_arquivo_final = f'cns_resolucoes_com_textos_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    df_completo.to_csv(nome_arquivo_final, index=False, encoding='utf-8')
     
     print("=" * 60)
-    print("CREATING COMPLETE DATABASE WITH PDF TEXTS")
-    print("=" * 60)
+    print("🎉 BASE COMPLETA CRIADA COM SUCESSO!")
+    print(f"📁 Arquivo salvo: {nome_arquivo_final}")
     
-    # Step 1: Extract texts from PDFs
-    print("\n🔍 STEP 1: Extracting texts from PDFs...")
-    extraction_start = datetime.now()
-    extracted_texts = process_all_pdfs_to_text(pdf_folder, max_pages_per_pdf)
-    extraction_end = datetime.now()
+    # Estatísticas
+    textos_validos = df_completo[df_completo['tem_erro'] == False]
+    print(f"✅ Resoluções com texto extraído: {len(textos_validos)}/{len(df_completo)} ({len(textos_validos)/len(df_completo)*100:.1f}%)")
     
-    if not extracted_texts:
-        print("❌ No texts extracted. Check if PDFs exist.")
-        return None
-    
-    print(f"✅ Extraction completed in {extraction_end - extraction_start}")
-    
-    # Step 2: Combine with CSV data
-    print("\n🔗 STEP 2: Combining texts with resolution data...")
-    combination_start = datetime.now()
-    df_complete = combine_csv_with_pdf_texts(csv_file, extracted_texts, pdf_folder)
-    combination_end = datetime.now()
-    
-    if df_complete is None:
-        print("❌ Error in data combination.")
-        return None
-    
-    print(f"✅ Combination completed in {combination_end - combination_start}")
-    
-    # Step 3: Save final result
-    print("\n💾 STEP 3: Saving complete database...")
-    final_filename = f'cns_resolucoes_com_textos_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
-    
-    df_complete.to_csv(final_filename, index=False, encoding='utf-8')
-    
-    # Final report
-    total_time = datetime.now() - extraction_start
-    
-    print("=" * 60)
-    print("🎉 COMPLETE DATABASE CREATED SUCCESSFULLY!")
-    print("=" * 60)
-    print(f"📁 File saved: {final_filename}")
-    print(f"⏱️ Total time: {total_time}")
-    print(f"📊 Total resolutions: {len(df_complete)}")
-    
-    # Text statistics
-    valid_texts = df_complete[
-        (df_complete['pdf_text'] != 'PDF_NOT_FOUND') &
-        (~df_complete['pdf_text'].str.startswith('ERROR_')) &
-        (df_complete['pdf_text_size'] > 0)
-    ]
-    
-    print(f"✅ Resolutions with extracted text: {len(valid_texts)} ({len(valid_texts)/len(df_complete)*100:.1f}%)")
-    
-    if len(valid_texts) > 0:
-        print(f"📝 Text statistics:")
-        print(f"   • Average size: {valid_texts['pdf_text_size'].mean():.0f} characters")
-        print(f"   • Largest text: {valid_texts['pdf_text_size'].max()} characters")
-        print(f"   • Smallest text: {valid_texts['pdf_text_size'].min()} characters")
-    
-    # Check available columns
-    print(f"📋 Available columns: {list(df_complete.columns)}")
-    
-    return df_complete
+    if not textos_validos.empty:
+        print("\n📊 Contagem por método de extração:")
+        print(textos_validos['metodo_extracao'].value_counts())
+
+    return df_completo
 
 
 def main():
-    """Main execution function."""
-    print("Starting PDF text extraction process...")
-    df_result = create_complete_database_with_texts()
+    """Função principal de execução do módulo."""
+    print("Iniciando processo de extração de texto PDF...")
+    df_resultado = criar_base_completa_com_textos()
     
-    if df_result is not None:
-        print("\n🎉 Process completed successfully!")
-        return df_result
+    if df_resultado is not None:
+        print("\n🎉 Processo concluído com sucesso!")
     else:
-        print("\n❌ Process failed. Check logs for details.")
-        return None
-
+        print("\n❌ Processo falhou. Verifique os logs para detalhes.")
 
 if __name__ == "__main__":
     main()

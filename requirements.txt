@@ -1,4 +1,12 @@
 requests>=2.28.0
 beautifulsoup4>=4.11.0
 pandas>=1.5.0
+
+# Para extração de texto de PDF
 pdfplumber>=0.7.0
+PyMuPDF>=1.23.0  # Fitz
+PyPDF2>=3.0.0
+
+# Para OCR (extração de texto de imagens)
+pytesseract>=0.3.10
+Pillow>=9.4.0
