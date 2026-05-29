@@ -119,11 +119,15 @@ def cmd_baixar(args):
     print(f"📥 Iniciando download de PDFs de: {arquivo_csv}")
     resultado = baixar_todos_pdfs(arquivo_csv, pular_existentes=True)
     
-    if resultado and isinstance(resultado, dict) and isinstance(resultado.get('sucessos', 0), int) and resultado['sucessos'] > 0:
-        print("✅ Download de PDFs concluído com sucesso!")
+    # A etapa é considerada um sucesso se não houver erros.
+    # Não importa se os arquivos foram baixados agora ou já existiam.
+    if resultado and isinstance(resultado, dict) and resultado.get('erros', 0) == 0:
+        print("✅ Etapa de download concluída (nenhum erro encontrado).")
         return True
     else:
-        print("❌ Download de PDFs falhou!")
+        # Mostra o número de erros, se disponível
+        num_erros = resultado.get('erros', 'desconhecido') if isinstance(resultado, dict) else 'desconhecido'
+        print(f"❌ Download de PDFs falhou! Erros reportados: {num_erros}")
         return False
 
 
